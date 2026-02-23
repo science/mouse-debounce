@@ -83,8 +83,10 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=$LOG_DIR
-DeviceAllow=/dev/input/* rw
-DeviceAllow=/dev/uinput rw
+# Note: DeviceAllow glob patterns don't work reliably with cgroup v2.
+# The service runs as root with default DevicePolicy=auto, which permits
+# /dev/input/* and /dev/uinput access. The other directives (ProtectHome,
+# ProtectSystem) provide meaningful containment.
 
 [Install]
 WantedBy=multi-user.target
