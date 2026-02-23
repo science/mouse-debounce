@@ -2,7 +2,10 @@
 set -euo pipefail
 
 INSTALL_BIN="/usr/local/bin/mouse-debounce"
+INSTALL_MONITOR="/usr/local/bin/mouse-drag-monitor"
 SERVICE_FILE="/etc/systemd/system/mouse-debounce.service"
+LOGROTATE_FILE="/etc/logrotate.d/mouse-debounce"
+LOG_DIR="/var/log/mouse-debounce"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
@@ -19,34 +22,69 @@ check_root() {
     fi
 }
 
+check_deps() {
+    if ! python3 -c "import evdev" 2>/dev/null; then
+        echo "Error: python3-evdev is required."
+        echo "  Install: sudo apt install python3-evdev"
+        exit 1
+    fi
+}
+
 do_install() {
     check_root
+    check_deps
 
     echo "Installing mouse-debounce..."
 
-    # Install binary
+    # Install binaries
     cp "$SCRIPT_DIR/mouse-debounce" "$INSTALL_BIN"
     chmod 755 "$INSTALL_BIN"
     echo "  Installed $INSTALL_BIN"
 
+    if [[ -f "$SCRIPT_DIR/mouse-drag-monitor" ]]; then
+        cp "$SCRIPT_DIR/mouse-drag-monitor" "$INSTALL_MONITOR"
+        chmod 755 "$INSTALL_MONITOR"
+        echo "  Installed $INSTALL_MONITOR"
+    fi
+
+    # Create log directory
+    mkdir -p "$LOG_DIR"
+    echo "  Created $LOG_DIR"
+
+    # Install logrotate config
+    cat > "$LOGROTATE_FILE" <<'LOGROTATE'
+/var/log/mouse-debounce/debounce.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    size 5M
+    copytruncate
+}
+LOGROTATE
+    echo "  Installed $LOGROTATE_FILE"
+
     # Install systemd service
-    cat > "$SERVICE_FILE" <<'UNIT'
+    cat > "$SERVICE_FILE" <<UNIT
 [Unit]
 Description=Mouse button debounce filter (fixes hardware switch bounce)
 After=multi-user.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/mouse-debounce --quiet
+ExecStart=$INSTALL_BIN --quiet --log-dir $LOG_DIR
 Restart=on-failure
 RestartSec=3
 
 # Harden the service
-ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=/home
+ProtectHome=true
 PrivateTmp=true
-NoNewPrivileges=false
+ReadWritePaths=$LOG_DIR
+DeviceAllow=/dev/input/* rw
+DeviceAllow=/dev/uinput rw
 
 [Install]
 WantedBy=multi-user.target
@@ -59,7 +97,10 @@ UNIT
     echo "  Service enabled and started"
 
     echo ""
-    echo "Done. Check status: systemctl status mouse-debounce.service"
+    echo "Done."
+    echo "  Status:  systemctl status mouse-debounce.service"
+    echo "  Logs:    journalctl -u mouse-debounce.service -f"
+    echo "  Logfile: $LOG_DIR/debounce.log"
 }
 
 do_uninstall() {
@@ -83,13 +124,23 @@ do_uninstall() {
         echo "  Removed $SERVICE_FILE"
     fi
 
+    if [[ -f "$LOGROTATE_FILE" ]]; then
+        rm "$LOGROTATE_FILE"
+        echo "  Removed $LOGROTATE_FILE"
+    fi
+
     if [[ -f "$INSTALL_BIN" ]]; then
         rm "$INSTALL_BIN"
         echo "  Removed $INSTALL_BIN"
     fi
 
+    if [[ -f "$INSTALL_MONITOR" ]]; then
+        rm "$INSTALL_MONITOR"
+        echo "  Removed $INSTALL_MONITOR"
+    fi
+
     echo ""
-    echo "Done. Log files remain at ~/.local/share/mouse-debounce/ (remove manually if desired)."
+    echo "Done. Logs remain at $LOG_DIR (remove manually if desired)."
 }
 
 case "${1:-}" in

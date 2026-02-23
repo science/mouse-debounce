@@ -41,18 +41,20 @@ BUTTON_CODES = {ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE,
 
 _real_user = os.environ.get("SUDO_USER", os.environ.get("USER", "root"))
 _real_home = Path(f"/home/{_real_user}") if _real_user != "root" else Path.home()
+# Default log dir; overridable via --log-dir
 LOG_DIR = _real_home / ".local" / "share" / "mouse-debounce"
-LOG_FILE = LOG_DIR / "debounce.log"
+LOG_FILE = None  # Set in main() after arg parsing
 
 
 def log(msg, also_print=True):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     line = f"[{ts}] {msg}"
-    try:
-        with open(LOG_FILE, "a") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+    if LOG_FILE:
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
     if also_print:
         print(line, flush=True)
 
@@ -324,8 +326,14 @@ def main():
                         help="Suppress per-event logging")
     parser.add_argument("--stats-interval", type=int, default=600,
                         help="Print stats every N seconds (default: 600)")
+    parser.add_argument("--log-dir", type=str, default=None,
+                        help="Directory for log files (default: ~/.local/share/mouse-debounce)")
     args = parser.parse_args()
 
+    global LOG_DIR, LOG_FILE
+    if args.log_dir:
+        LOG_DIR = Path(args.log_dir)
+    LOG_FILE = LOG_DIR / "debounce.log"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.device:
