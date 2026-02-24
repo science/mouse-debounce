@@ -509,6 +509,9 @@ class TestButtonRemapping:
         mock_uinput = MagicMock()
 
         with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            # With remap: UInput(events=...) constructor is called
+            mock_uinput_class.return_value = mock_uinput
+            # Without remap: UInput.from_device() is called
             mock_uinput_class.from_device.return_value = mock_uinput
             mouse = debounce_module.DelayedDebouncedMouse(
                 mock_device, threshold_ms, quiet=True,

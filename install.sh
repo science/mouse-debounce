@@ -34,6 +34,21 @@ do_install() {
     check_root
     check_deps
 
+    # Clean up legacy mouse-debounce installation if present
+    if systemctl is-active --quiet mouse-debounce.service 2>/dev/null; then
+        systemctl stop mouse-debounce.service
+    fi
+    if systemctl is-enabled --quiet mouse-debounce.service 2>/dev/null; then
+        systemctl disable mouse-debounce.service
+    fi
+    if [[ -f /etc/systemd/system/mouse-debounce.service ]]; then
+        rm /etc/systemd/system/mouse-debounce.service
+        systemctl daemon-reload
+        echo "  Removed legacy mouse-debounce.service"
+    fi
+    [[ -f /usr/local/bin/mouse-debounce ]] && rm /usr/local/bin/mouse-debounce
+    [[ -f /etc/logrotate.d/mouse-debounce ]] && rm /etc/logrotate.d/mouse-debounce
+
     echo "Installing mouse-filter..."
 
     # Install binaries
@@ -74,7 +89,7 @@ After=multi-user.target
 
 [Service]
 Type=simple
-ExecStart=$INSTALL_BIN --quiet --log-dir $LOG_DIR
+ExecStart=$INSTALL_BIN --quiet --log-dir $LOG_DIR --remap BTN_EXTRA=KEY_VOLUMEUP --remap BTN_SIDE=KEY_VOLUMEDOWN --remap BTN_MIDDLE=KEY_MUTE
 Restart=on-failure
 RestartSec=3
 

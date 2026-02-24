@@ -197,7 +197,21 @@ class DelayedDebouncedMouse:
         self.max_lag_ms = 0.0
         self._wall_offset = None  # Calibrated offset: wall_clock - kernel_timestamp
 
-        self.uinput = UInput.from_device(device, name=f"debounced {device.name}")
+        # Build uinput device. If we have remaps, add target key codes to
+        # the capabilities — the physical mouse doesn't advertise KEY_VOLUMEUP etc,
+        # so uinput would silently drop those events without this.
+        if self.button_remap:
+            caps = device.capabilities(verbose=False)
+            key_caps = list(caps.get(ecodes.EV_KEY, []))
+            for dst_code in self.button_remap.values():
+                if dst_code not in key_caps:
+                    key_caps.append(dst_code)
+            caps[ecodes.EV_KEY] = key_caps
+            # Remove EV_SYN — UInput adds it automatically and rejects duplicates
+            caps.pop(ecodes.EV_SYN, None)
+            self.uinput = UInput(events=caps, name=f"debounced {device.name}")
+        else:
+            self.uinput = UInput.from_device(device, name=f"debounced {device.name}")
         device.grab()
 
     def _measure_lag(self, event):
@@ -449,10 +463,15 @@ def main():
     log(f"    All releases:            delayed {args.threshold}ms before forwarding")
     log(f"    Buttons filtered:        LEFT, RIGHT, MIDDLE, SIDE, EXTRA")
     if button_remap:
+        def _ecode_name(code):
+            """Get a single human-readable name for an evdev code."""
+            for mapping in (ecodes.BTN, ecodes.KEY):
+                name = mapping.get(code)
+                if name is not None:
+                    return name if isinstance(name, str) else name[-1]
+            return str(code)
         for src, dst in button_remap.items():
-            src_name = ecodes.BTN.get(src, ecodes.KEY.get(src, str(src)))
-            dst_name = ecodes.KEY.get(dst, ecodes.BTN.get(dst, str(dst)))
-            log(f"    Remap:                   {src_name} ({src}) -> {dst_name} ({dst})")
+            log(f"    Remap:                   {_ecode_name(src)} ({src}) -> {_ecode_name(dst)} ({dst})")
 
     running = True
 
