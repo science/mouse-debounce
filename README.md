@@ -1,6 +1,8 @@
 # mouse-tools
 
-Mouse management utilities for Linux, built on evdev.
+Mouse management utilities for Linux, built on evdev. A single `mouse-filter` daemon handles both button debounce and button remapping — replacing the need for separate tools like input-remapper.
+
+## Features
 
 - **Button debounce** — Fixes hardware switch bounce on worn Logitech (and other) mice that causes phantom button releases during drags and false double-clicks.
 - **Button remapping** — Remaps mouse buttons to keyboard keys (e.g., forward/back to volume up/down). A lightweight replacement for input-remapper when all you need is simple button remaps.
@@ -15,11 +17,28 @@ Logitech mice use Omron micro-switches that wear out over time. When worn, the s
 
 ## How It Works
 
+### Debounce
+
 Intercepts raw evdev events from all physical mice. Button releases are held for a configurable threshold (default: 60ms). If a re-press arrives during the hold window, both events are suppressed — the button was never really released. Genuine releases get the threshold duration of added latency (imperceptible for non-gaming use).
 
 ```
 Hardware: press ──── release(bounce) ── press(bounce) ──── release(real)
 Output:   press ────────────────────────────────────────── release
+```
+
+Only drag-bounces are suppressed (holds >= 150ms). Fast double-clicks (holds < 150ms) are always allowed through, even if the gap between clicks is within the debounce window.
+
+### Button Remapping
+
+Remap mouse buttons to keyboard keys using `--remap`. Remapped buttons bypass debounce entirely and are forwarded immediately — they don't suffer from switch bounce and don't need the added latency.
+
+The remap target keycodes are injected into the virtual uinput device's capability list, since the physical mouse doesn't advertise keyboard keys like `KEY_VOLUMEUP`.
+
+### Event Pipeline
+
+```
+Physical mouse → /dev/input/eventN → mouse-filter (grabs device)
+    → remap buttons (if configured) → debounce filter → uinput virtual device → X11/Wayland
 ```
 
 ## Requirements
@@ -29,13 +48,26 @@ Output:   press ─────────────────────�
 - python3-evdev (`sudo apt install python3-evdev`)
 - Root access (for evdev device grab + uinput)
 
-## Install
+## Quick Start
+
+```bash
+# Run with debounce + volume button remapping
+sudo ./run.sh
+
+# Or run directly with custom options
+sudo ./mouse-filter --threshold 70 \
+    --remap BTN_EXTRA=KEY_VOLUMEUP \
+    --remap BTN_SIDE=KEY_VOLUMEDOWN \
+    --remap BTN_MIDDLE=KEY_MUTE
+```
+
+## Install (systemd service)
 
 ```bash
 sudo ./install.sh
 ```
 
-This copies the filter to `/usr/local/bin/`, installs a systemd system service, and enables it to start on boot.
+This copies `mouse-filter` to `/usr/local/bin/`, installs a systemd system service (with volume remap flags), and enables it to start on boot. Also cleans up any legacy `mouse-debounce` installation.
 
 ## Uninstall
 
@@ -43,42 +75,37 @@ This copies the filter to `/usr/local/bin/`, installs a systemd system service, 
 sudo ./install.sh --uninstall
 ```
 
-## Manual Usage
+## CLI Reference
 
 ```bash
-# Run with default 60ms threshold
-sudo mouse-filter
+sudo mouse-filter [OPTIONS]
 
-# Quiet mode (only log suppressions to file)
-sudo mouse-filter --quiet
-
-# Custom threshold and near-miss warning window
-sudo mouse-filter --threshold 80 --warn-threshold 120
-
-# Filter specific device(s) only
-sudo mouse-filter --device /dev/input/event23
+Options:
+  --threshold N         Debounce threshold in ms (default: 60)
+  --hold-threshold N    Only debounce releases after holds longer than N ms.
+                        Short clicks below this are never debounced. (default: 150)
+  --warn-threshold N    Log NEAR-MISS for release→press gaps between
+                        threshold and N ms (default: 100)
+  --remap SRC=DST       Remap a button to a key, e.g. BTN_EXTRA=KEY_VOLUMEUP.
+                        Remapped buttons bypass debounce. Repeatable.
+  --device PATH         Specific evdev device(s) to filter (default: all mice)
+  --lag-threshold N     Log LAG_SPIKE when processing > N ms behind kernel (default: 10)
+  --quiet               Suppress per-event logging (SUPPRESSED/NEAR-MISS still log)
+  --stats-interval N    Print stats every N seconds (default: 600)
+  --log-dir PATH        Directory for log files
 ```
-
-## Button Remapping
-
-Remap mouse buttons to keyboard keys using `--remap`:
-
-```bash
-# Remap forward/back to volume up/down, middle-click to mute
-sudo mouse-filter --remap BTN_EXTRA=KEY_VOLUMEUP --remap BTN_SIDE=KEY_VOLUMEDOWN --remap BTN_MIDDLE=KEY_MUTE
-```
-
-Remapped buttons are forwarded immediately (not debounced), since volume/mute buttons don't suffer from switch bounce. This replaces input-remapper for simple mouse button remapping with zero additional overhead — the events are already flowing through the debounce filter.
 
 ## Logging
 
-Events are logged to `~/.local/share/mouse-filter/debounce.log` (uses `$SUDO_USER` home, not root).
+Events are logged to `~/.local/share/mouse-filter/debounce.log` (uses `$SUDO_USER` home, not root). When installed as a service, logs go to `/var/log/mouse-filter/debounce.log`.
 
 | Event | Meaning |
 |-------|---------|
-| `SUPPRESSED` | Bounce caught and filtered. Shows the release→re-press gap in ms. |
-| `NEAR-MISS` | Release→re-press gap exceeded threshold but was within warning window. The filter didn't catch it. Consider raising `--threshold` if these correlate with UX glitches. |
-| `STATS` | Periodic summary of total clicks and suppressions per device. |
+| `SUPPRESSED` | Drag-bounce caught and filtered. Shows the release→re-press gap and hold duration. Always logged. |
+| `NEAR-MISS` | Release→re-press gap was between threshold and warn-threshold, after a drag hold. The filter didn't catch it. Consider raising `--threshold`. Always logged. |
+| `STATS` | Periodic summary: total clicks, suppressions, events processed, lag spikes, max lag per device. |
+
+Fast double-clicks (short hold < 150ms followed by fast re-press) are silently allowed through without logging — they're normal user behavior, not bounces.
 
 ## Diagnostics
 
