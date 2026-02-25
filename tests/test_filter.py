@@ -660,3 +660,261 @@ class TestFindMice:
 
         assert len(mice) == 1
         assert mice[0].name == "MX Anywhere 2S Mouse"
+
+
+class TestDeviceReconnection:
+    """Tests for automatic device reconnection after disconnect.
+
+    When a mouse disconnects (e.g., Bluetooth auto-power-off, USB unplug),
+    mouse-filter should detect when it comes back via inotify on /dev/input/
+    and reconnect immediately. No polling — inotify gives us a pollable FD
+    for the existing select() loop with zero overhead until an event fires.
+
+    Bug evidence from production logs:
+        [16:25:11] Device disconnected: MX Anywhere 2S Mouse
+        ... (7 hours of silence, no reconnection attempt) ...
+        [23:34:47] Debounce filter stopped.  (manual restart)
+    """
+
+    def test_find_new_mice_excludes_existing(self, debounce_module):
+        """find_new_mice returns only devices not already being monitored."""
+        existing = MagicMock()
+        existing.path = "/dev/input/event10"
+        existing.phys = "usb-0000:00:14.0-1/input0"
+        existing.name = "Already Monitored Mouse"
+
+        new_dev = MagicMock()
+        new_dev.path = "/dev/input/event11"
+        new_dev.phys = "bt-addr"
+        new_dev.name = "Reconnected Mouse"
+
+        with patch.object(debounce_module, 'find_mice', return_value=[existing, new_dev]):
+            result = debounce_module.find_new_mice({"/dev/input/event10"})
+
+        assert len(result) == 1
+        assert result[0] is new_dev
+
+    def test_find_new_mice_closes_duplicate_fds(self, debounce_module):
+        """find_new_mice closes FDs for already-monitored devices to prevent leaks."""
+        dup = MagicMock()
+        dup.path = "/dev/input/event5"
+
+        with patch.object(debounce_module, 'find_mice', return_value=[dup]):
+            result = debounce_module.find_new_mice({"/dev/input/event5"})
+
+        assert result == []
+        dup.close.assert_called_once()
+
+    def test_find_new_mice_returns_all_when_none_active(self, debounce_module):
+        """With no active devices, all discovered mice are new."""
+        mouse = MagicMock()
+        mouse.path = "/dev/input/event7"
+
+        with patch.object(debounce_module, 'find_mice', return_value=[mouse]):
+            result = debounce_module.find_new_mice(set())
+
+        assert len(result) == 1
+        assert result[0] is mouse
+        mouse.close.assert_not_called()
+
+    def test_reconnect_scenario_end_to_end(self, debounce_module):
+        """Full reconnection flow: setup → disconnect → inotify → reconnect.
+
+        Simulates the exact scenario from production: BT mouse powers off,
+        device disconnects (OSError), mouse powers back on and reappears
+        at a possibly different event path, inotify fires, check_new_device
+        identifies it, filter picks it up.
+        """
+        from evdev import ecodes
+
+        # 1. Initial setup — one mouse being monitored
+        mock_device = MagicMock()
+        mock_device.name = "MX Anywhere 2S Mouse"
+        mock_device.path = "/dev/input/event22"
+        mock_device.fd = 10
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_cls:
+            mock_cls.from_device.return_value = mock_uinput
+            dm = debounce_module.DelayedDebouncedMouse(mock_device, 60, quiet=True)
+
+        mice = [dm]
+        fd_map = {dm.device.fd: dm}
+
+        # 2. Device disconnects (simulating OSError path in main loop)
+        dm.close()
+        del fd_map[dm.device.fd]
+        mice.remove(dm)
+
+        assert len(mice) == 0
+        assert len(fd_map) == 0
+
+        # 3. Inotify fires for reconnected device (different event path)
+        active_paths = {m.device.path for m in mice}
+        reconnected = MagicMock()
+        reconnected.name = "MX Anywhere 2S Mouse"
+        reconnected.path = "/dev/input/event25"
+        reconnected.phys = "cc:15:31:96:1f:58"
+        reconnected.fd = 14
+        reconnected.capabilities.return_value = {
+            ecodes.EV_KEY: [ecodes.BTN_LEFT],
+            ecodes.EV_REL: [ecodes.REL_X],
+        }
+
+        with patch('evdev.InputDevice', return_value=reconnected):
+            dev = debounce_module.check_new_device(
+                '/dev/input/event25', active_paths)
+
+        assert dev is not None
+        assert dev.name == "MX Anywhere 2S Mouse"
+
+        # 4. New device gets set up successfully
+        new_uinput = MagicMock()
+        with patch.object(debounce_module, 'UInput') as mock_cls:
+            mock_cls.from_device.return_value = new_uinput
+            new_dm = debounce_module.DelayedDebouncedMouse(
+                reconnected, 60, quiet=True)
+
+        mice.append(new_dm)
+        fd_map[new_dm.device.fd] = new_dm
+
+        assert len(mice) == 1
+        assert len(fd_map) == 1
+
+        # Verify the new device is functional (can process events)
+        ev = make_event(ecodes.EV_REL, ecodes.REL_X, 5)
+        new_dm.process_event(ev)
+        new_uinput.write_event.assert_called_with(ev)
+
+
+class TestDeviceMonitor:
+    """Tests for inotify-based device hotplug monitoring.
+
+    Instead of polling find_mice() every N seconds (which blocks the event
+    loop for 50-350ms scanning all /dev/input/* devices), we use inotify
+    to watch /dev/input/ for new device files. The inotify FD goes into
+    the existing select() call — zero overhead until a device actually
+    connects. When it fires, we check only the specific new device path.
+    """
+
+    def test_drain_inotify_parses_event_files(self, debounce_module):
+        """drain_inotify should extract /dev/input/event* paths from data."""
+        import struct as s
+        name = b'event25\0'
+        data = s.pack('iIII', 1, 0x100, 0, len(name)) + name
+
+        with patch('os.read', return_value=data):
+            paths = debounce_module.drain_inotify(5)
+
+        assert paths == ['/dev/input/event25']
+
+    def test_drain_inotify_ignores_non_event_files(self, debounce_module):
+        """drain_inotify should ignore non-event files (mice, js0, etc)."""
+        import struct as s
+        # "mice" device node — not an event* file, should be ignored
+        name = b'mice\0\0\0\0'
+        data = s.pack('iIII', 1, 0x100, 0, len(name)) + name
+
+        with patch('os.read', return_value=data):
+            paths = debounce_module.drain_inotify(5)
+
+        assert paths == []
+
+    def test_drain_inotify_handles_multiple_events(self, debounce_module):
+        """drain_inotify should parse multiple inotify events in one read."""
+        import struct as s
+        name1 = b'event10\0'
+        name2 = b'event11\0'
+        data = (s.pack('iIII', 1, 0x100, 0, len(name1)) + name1 +
+                s.pack('iIII', 1, 0x100, 0, len(name2)) + name2)
+
+        with patch('os.read', return_value=data):
+            paths = debounce_module.drain_inotify(5)
+
+        assert paths == ['/dev/input/event10', '/dev/input/event11']
+
+    def test_drain_inotify_handles_read_error(self, debounce_module):
+        """drain_inotify should return empty list on read error."""
+        with patch('os.read', side_effect=OSError("EAGAIN")):
+            paths = debounce_module.drain_inotify(5)
+
+        assert paths == []
+
+    def test_check_new_device_finds_mouse(self, debounce_module):
+        """check_new_device should return device for a physical mouse."""
+        from evdev import ecodes
+
+        mock_dev = MagicMock()
+        mock_dev.name = "Test Mouse"
+        mock_dev.phys = "usb-0000:00:14.0-1/input0"
+        mock_dev.capabilities.return_value = {
+            ecodes.EV_KEY: [ecodes.BTN_LEFT],
+            ecodes.EV_REL: [ecodes.REL_X],
+        }
+
+        with patch('evdev.InputDevice', return_value=mock_dev):
+            result = debounce_module.check_new_device(
+                '/dev/input/event5', set())
+
+        assert result is mock_dev
+        mock_dev.close.assert_not_called()
+
+    def test_check_new_device_rejects_already_monitored(self, debounce_module):
+        """check_new_device should return None for already-monitored paths."""
+        result = debounce_module.check_new_device(
+            '/dev/input/event5', {'/dev/input/event5'})
+        assert result is None
+
+    def test_check_new_device_rejects_virtual(self, debounce_module):
+        """check_new_device should reject uinput virtual devices."""
+        from evdev import ecodes
+
+        mock_dev = MagicMock()
+        mock_dev.name = "debounced Test Mouse"
+        mock_dev.phys = "py-evdev-uinput"
+        mock_dev.capabilities.return_value = {
+            ecodes.EV_KEY: [ecodes.BTN_LEFT],
+            ecodes.EV_REL: [ecodes.REL_X],
+        }
+
+        with patch('evdev.InputDevice', return_value=mock_dev):
+            result = debounce_module.check_new_device(
+                '/dev/input/event5', set())
+
+        assert result is None
+        mock_dev.close.assert_called_once()
+
+    def test_check_new_device_rejects_non_mouse(self, debounce_module):
+        """check_new_device should reject devices without mouse capabilities."""
+        from evdev import ecodes
+
+        mock_dev = MagicMock()
+        mock_dev.name = "USB Keyboard"
+        mock_dev.phys = "usb-0000:00:14.0-2/input0"
+        mock_dev.capabilities.return_value = {
+            ecodes.EV_KEY: [30, 31, 32],  # letter keys, no BTN_LEFT
+        }
+
+        with patch('evdev.InputDevice', return_value=mock_dev):
+            result = debounce_module.check_new_device(
+                '/dev/input/event5', set())
+
+        assert result is None
+        mock_dev.close.assert_called_once()
+
+    def test_main_uses_inotify_not_polling(self, debounce_module):
+        """main() should use inotify for hotplug, not periodic polling.
+
+        Polling find_mice() every N seconds blocks the event loop for
+        50-350ms, causing lag spikes. inotify is event-driven with zero
+        overhead until a device actually connects.
+        """
+        import inspect
+        source = inspect.getsource(debounce_module.main)
+
+        assert 'init_inotify' in source, (
+            "main() should use inotify to watch /dev/input/ for new devices"
+        )
+        assert 'drain_inotify' in source, (
+            "main() should drain inotify events when the monitor FD is readable"
+        )

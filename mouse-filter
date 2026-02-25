@@ -17,6 +17,8 @@ Usage: sudo mouse-filter [--threshold 60]
 """
 
 import argparse
+import ctypes
+import ctypes.util
 import os
 import select
 import signal
@@ -81,6 +83,102 @@ def find_mice():
         else:
             dev.close()
     return mice
+
+
+def find_new_mice(existing_paths):
+    """Find mice not already being monitored. Closes duplicate FDs.
+
+    Calls find_mice() to discover all physical mice, then filters out
+    any whose path is already in existing_paths. Devices that are already
+    monitored get their file descriptors closed to prevent leaks.
+
+    Note: this scans ALL /dev/input devices (slow, ~50-350ms). Used only at
+    startup. For runtime hotplug, use inotify + check_new_device() instead.
+    """
+    all_mice = find_mice()
+    new = []
+    for m in all_mice:
+        if m.path in existing_paths:
+            m.close()
+        else:
+            new.append(m)
+    return new
+
+
+def init_inotify():
+    """Create inotify watch on /dev/input/ for new device files.
+
+    Returns a file descriptor that becomes readable when device files are
+    created in /dev/input/. Add this FD to select() alongside mouse FDs.
+    Returns -1 on failure.
+    """
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+        IN_CREATE = 0x00000100
+        IN_NONBLOCK = 0x00000800
+        fd = libc.inotify_init1(IN_NONBLOCK)
+        if fd < 0:
+            return -1
+        wd = libc.inotify_add_watch(fd, b'/dev/input', IN_CREATE)
+        if wd < 0:
+            os.close(fd)
+            return -1
+        return fd
+    except Exception:
+        return -1
+
+
+def drain_inotify(fd):
+    """Read pending inotify events, return list of new /dev/input/event* paths.
+
+    Parses the raw inotify_event structs from the kernel. Filters to only
+    return event* files (the actual input device nodes), ignoring other
+    entries like 'mice', 'js0', etc.
+    """
+    paths = []
+    try:
+        data = os.read(fd, 65536)
+    except OSError:
+        return paths
+    hdr_size = struct.calcsize('iIII')
+    offset = 0
+    while offset + hdr_size <= len(data):
+        wd, mask, cookie, length = struct.unpack_from('iIII', data, offset)
+        offset += hdr_size
+        if offset + length > len(data):
+            break
+        name = data[offset:offset + length].rstrip(b'\0').decode(
+            'utf-8', errors='replace')
+        offset += length
+        if name.startswith('event'):
+            paths.append(f'/dev/input/{name}')
+    return paths
+
+
+def check_new_device(path, existing_paths):
+    """Check if a specific device path is a physical mouse not already monitored.
+
+    Opens just the one device (O(1) instead of scanning all devices), checks
+    if it's a real mouse, and returns the evdev.InputDevice if so.
+    Returns None (and closes the FD) if it's virtual, non-mouse, or already
+    monitored.
+    """
+    if path in existing_paths:
+        return None
+    try:
+        dev = evdev.InputDevice(path)
+    except Exception:
+        return None
+    if "uinput" in (dev.phys or "").lower() or "input-remapper" in dev.name.lower():
+        dev.close()
+        return None
+    caps = dev.capabilities()
+    key_caps = caps.get(ecodes.EV_KEY, [])
+    rel_caps = caps.get(ecodes.EV_REL, [])
+    if ecodes.BTN_LEFT in key_caps and ecodes.REL_X in rel_caps:
+        return dev
+    dev.close()
+    return None
 
 
 class DebouncedMouse:
@@ -486,6 +584,15 @@ def main():
     fd_map = {m.device.fd: m for m in mice}
     last_stats = time.monotonic()
 
+    # Watch /dev/input/ for new devices via inotify (zero-overhead until event)
+    monitor_fd = -1
+    if not args.device:
+        monitor_fd = init_inotify()
+        if monitor_fd >= 0:
+            log(f"  Device hotplug:    watching /dev/input/ via inotify")
+        else:
+            log(f"  Device hotplug:    inotify unavailable, no auto-reconnect")
+
     while running:
         # Calculate select timeout: need to flush pending releases on time
         timeout = None
@@ -496,13 +603,20 @@ def main():
         if timeout is None:
             timeout = 1.0  # Wake up periodically for stats
 
+        # Build FD list: mouse devices + inotify monitor
+        watch_fds = list(fd_map.keys())
+        if monitor_fd >= 0:
+            watch_fds.append(monitor_fd)
+
         try:
-            readable, _, _ = select.select(list(fd_map.keys()), [], [], timeout)
+            readable, _, _ = select.select(watch_fds, [], [], timeout)
         except (KeyboardInterrupt, ValueError):
             break
 
         # Process readable devices
         for fd in readable:
+            if fd == monitor_fd:
+                continue  # Handle inotify below
             mouse = fd_map[fd]
             try:
                 for event in mouse.device.read():
@@ -512,6 +626,29 @@ def main():
                 mouse.close()
                 del fd_map[fd]
                 mice.remove(mouse)
+
+        # Handle inotify: new device appeared in /dev/input/
+        if monitor_fd in readable:
+            new_paths = drain_inotify(monitor_fd)
+            active_paths = {m.device.path for m in mice}
+            for path in new_paths:
+                dev = check_new_device(path, active_paths)
+                if dev is None:
+                    continue
+                try:
+                    dm = DelayedDebouncedMouse(
+                        dev, args.threshold,
+                        warn_threshold_ms=args.warn_threshold,
+                        hold_threshold_ms=args.hold_threshold,
+                        quiet=args.quiet,
+                        lag_threshold_ms=args.lag_threshold,
+                        button_remap=button_remap)
+                    mice.append(dm)
+                    fd_map[dm.device.fd] = dm
+                    active_paths.add(dev.path)
+                    log(f"Reconnected: {dev.name} ({dev.path}) -> {dm.uinput.name}")
+                except Exception as e:
+                    log(f"Error setting up reconnected {dev.name}: {e}")
 
         # Flush expired pending releases
         for m in mice:
@@ -528,6 +665,8 @@ def main():
             last_stats = now
 
     # Cleanup
+    if monitor_fd >= 0:
+        os.close(monitor_fd)
     for m in mice:
         log(f"FINAL: {m.name}: clicks={m.total_clicks}, suppressed={m.suppressed}")
         m.close()
