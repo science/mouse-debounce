@@ -41,6 +41,9 @@ DEBOUNCE_MS = 60
 HOLD_THRESHOLD_MS = 150  # Hold longer than this = drag (debounce applies)
 BUTTON_CODES = {ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE,
                 ecodes.BTN_SIDE, ecodes.BTN_EXTRA}
+BTN_NAMES = {ecodes.BTN_LEFT: "LEFT", ecodes.BTN_RIGHT: "RIGHT",
+             ecodes.BTN_MIDDLE: "MIDDLE", ecodes.BTN_SIDE: "SIDE",
+             ecodes.BTN_EXTRA: "EXTRA"}
 
 _real_user = os.environ.get("SUDO_USER", os.environ.get("USER", "root"))
 _real_home = Path(f"/home/{_real_user}") if _real_user != "root" else Path.home()
@@ -467,19 +470,18 @@ class DebouncedMouse:
 
 class DelayedDebouncedMouse:
     """
-    Debounce by delaying button releases.
+    Debounce by delaying drag releases only.
 
-    When a release arrives, hold it for `threshold_ms` before forwarding.
-    If a press arrives during the hold period, suppress both the release
-    and re-press (the button was never really released). This adds slight
-    latency to genuine releases but completely masks bounce.
-
-    The added latency (60ms default) is imperceptible for normal use.
+    Click releases (hold < hold_threshold) are forwarded immediately — no
+    delay, no interference with double-clicks. Only drag releases (hold >=
+    hold_threshold) are held for `threshold_ms` before forwarding. If a
+    re-press arrives during the hold period, both the release and re-press
+    are suppressed (the button was never really released during the drag).
     """
 
     def __init__(self, device, threshold_ms, warn_threshold_ms=None,
                  hold_threshold_ms=None, quiet=False, lag_threshold_ms=10,
-                 button_remap=None, diagnose_move=False):
+                 button_remap=None, diagnose_move=False, diagnose_clicks=False):
         self.device = device
         self.threshold_s = threshold_ms / 1000.0
         self.button_remap = button_remap or {}  # {src_code: dst_code}
@@ -495,6 +497,8 @@ class DelayedDebouncedMouse:
         self.press_time = {}        # btn -> monotonic_time
         # Per-button: last forwarded release - timestamps and whether it was a drag
         self.last_forwarded_release = {}  # btn -> (original_ts, forwarded_ts, was_drag)
+        self.diagnose_clicks = diagnose_clicks
+        self.last_press_forwarded = {}  # btn -> monotonic_time (for pp_gap tracking)
         self.suppressed = 0
         self.total_clicks = 0
         # Latency tracking
@@ -585,37 +589,26 @@ class DelayedDebouncedMouse:
         if event.value == 1:  # Press
             self.total_clicks += 1
             if btn in self.pending_release:
-                _, release_ts, was_drag = self.pending_release[btn]
+                # Only drag releases are ever pending — this is a drag bounce
+                _, release_ts, _ = self.pending_release[btn]
                 gap_ms = (now - release_ts) * 1000
-
-                if was_drag:
-                    # Long hold followed by fast re-press = drag bounce → suppress
-                    # Don't update press_time — the button was never really released,
-                    # so the original press is still the active one.
-                    hold_ms = (release_ts - self.press_time.get(btn, release_ts)) * 1000
-                    del self.pending_release[btn]
-                    self.suppressed += 1
-                    btn_name = {272: "LEFT", 273: "RIGHT", 274: "MIDDLE",
-                                275: "SIDE", 276: "EXTRA"}.get(btn, str(btn))
-                    log(f"SUPPRESSED bounce on {self.name}: {btn_name} "
-                        f"gap={gap_ms:.1f}ms hold={hold_ms:.0f}ms "
-                        f"(suppressed={self.suppressed} total)")
-                    return False
-                else:
-                    # Short hold followed by fast re-press = fast double-click → allow
-                    # Flush the pending release immediately, then forward the press
-                    pending_event, pending_ts, _ = self.pending_release.pop(btn)
-                    self.uinput.write_event(pending_event)
-                    syn = evdev.InputEvent(0, 0, ecodes.EV_SYN, ecodes.SYN_REPORT, 0)
-                    self.uinput.write_event(syn)
-                    self.last_forwarded_release[btn] = (pending_ts, now, False)
-                    # New click starts now
-                    self.press_time[btn] = now
-                    self.uinput.write_event(event)
-                    return True
+                hold_ms = (release_ts - self.press_time.get(btn, release_ts)) * 1000
+                del self.pending_release[btn]
+                self.suppressed += 1
+                btn_name = BTN_NAMES.get(btn, str(btn))
+                log(f"SUPPRESSED bounce on {self.name}: {btn_name} "
+                    f"gap={gap_ms:.1f}ms hold={hold_ms:.0f}ms "
+                    f"(suppressed={self.suppressed} total)")
+                if self.diagnose_clicks:
+                    prev_pp = self.last_press_forwarded.get(btn)
+                    pp_str = f"{(now - prev_pp) * 1000:.0f}ms" if prev_pp is not None else "--"
+                    log(f"CLICK_DIAG: {btn_name} PRESS SUPPRESSED "
+                        f"pp_gap={pp_str} hold={hold_ms:.0f}ms gap={gap_ms:.1f}ms",
+                        also_print=False)
+                return False
             else:
                 self.press_time[btn] = now
-                # Normal press - check for near-miss (only after drags, not clicks)
+                # Check for near-miss (only after drags, not clicks)
                 last_rel = self.last_forwarded_release.get(btn)
                 if last_rel is not None:
                     orig_ts, fwd_ts, prev_was_drag = last_rel
@@ -623,13 +616,21 @@ class DelayedDebouncedMouse:
                         hardware_gap_ms = (now - orig_ts) * 1000
                         if hardware_gap_ms < self.warn_threshold_s * 1000:
                             thresh_ms = self.threshold_s * 1000
-                            btn_name = {272: "LEFT", 273: "RIGHT", 274: "MIDDLE",
-                                        275: "SIDE", 276: "EXTRA"}.get(btn, str(btn))
+                            btn_name = BTN_NAMES.get(btn, str(btn))
                             log(f"NEAR-MISS on {self.name}: {btn_name} "
                                 f"hardware_gap={hardware_gap_ms:.1f}ms "
                                 f"(threshold={thresh_ms:.0f}ms, "
                                 f"escaped by {hardware_gap_ms - thresh_ms:.1f}ms)")
                 self.uinput.write_event(event)
+                if self.diagnose_clicks:
+                    prev_pp = self.last_press_forwarded.get(btn)
+                    pp_str = f"{(now - prev_pp) * 1000:.0f}ms" if prev_pp is not None else "--"
+                    fwd_rel = self.last_forwarded_release.get(btn)
+                    rp_str = f"{(now - fwd_rel[1]) * 1000:.0f}ms" if fwd_rel else "--"
+                    log(f"CLICK_DIAG: {BTN_NAMES.get(btn, str(btn))} PRESS "
+                        f"pp_gap={pp_str} rp_gap={rp_str} path=normal",
+                        also_print=False)
+                    self.last_press_forwarded[btn] = now
                 return True
 
         elif event.value == 0:  # Release
@@ -637,9 +638,23 @@ class DelayedDebouncedMouse:
             hold_start = self.press_time.get(btn, now)
             hold_duration = now - hold_start
             was_drag = hold_duration >= self.hold_threshold_s
-            # Don't forward yet - hold it for the debounce window
-            self.pending_release[btn] = (event, now, was_drag)
-            return True  # Queued, not yet forwarded
+            if was_drag:
+                # Drag release: delay for bounce detection
+                self.pending_release[btn] = (event, now, True)
+                if self.diagnose_clicks:
+                    log(f"CLICK_DIAG: {BTN_NAMES.get(btn, str(btn))} RELEASE "
+                        f"hold={hold_duration*1000:.0f}ms type=drag -> queued",
+                        also_print=False)
+                return True  # Queued, not yet forwarded
+            else:
+                # Click release: forward immediately (no bounce risk)
+                self.uinput.write_event(event)
+                self.last_forwarded_release[btn] = (now, now, False)
+                if self.diagnose_clicks:
+                    log(f"CLICK_DIAG: {BTN_NAMES.get(btn, str(btn))} RELEASE "
+                        f"hold={hold_duration*1000:.0f}ms type=click -> forwarded",
+                        also_print=False)
+                return True  # Forwarded immediately
 
         else:
             self.uinput.write_event(event)
@@ -659,6 +674,11 @@ class DelayedDebouncedMouse:
                 expired.append(btn)
                 self.uinput.write_event(event)
                 self.last_forwarded_release[btn] = (orig_ts, now, was_drag)
+                if self.diagnose_clicks:
+                    log(f"CLICK_DIAG: {BTN_NAMES.get(btn, str(btn))} FLUSH "
+                        f"waited={(now - orig_ts) * 1000:.0f}ms "
+                        f"type={'drag' if was_drag else 'click'}",
+                        also_print=False)
         for btn in expired:
             del self.pending_release[btn]
         if expired:
@@ -717,6 +737,10 @@ def main():
                         help="Enable movement pipeline diagnostics. Reports per-stage "
                              "latency breakdown (input, batch, loop, write, X11) at each "
                              "stats interval. Use to identify cursor lag sources.")
+    parser.add_argument("--diagnose-clicks", action="store_true",
+                        help="Log detailed click timing to log file (not stdout). "
+                             "Shows every press/release with hold durations, gap timing, "
+                             "and path decisions to diagnose double-click issues.")
     args = parser.parse_args()
 
     # Parse button remaps
@@ -763,7 +787,8 @@ def main():
                                        quiet=args.quiet,
                                        lag_threshold_ms=args.lag_threshold,
                                        button_remap=button_remap,
-                                       diagnose_move=args.diagnose_move)
+                                       diagnose_move=args.diagnose_move,
+                                       diagnose_clicks=args.diagnose_clicks)
             mice.append(dm)
             log(f"Filtering: {dev.name} ({dev.path}) -> {dm.uinput.name}")
         except Exception as e:
@@ -788,9 +813,8 @@ def main():
     log(f"  Log file:          {LOG_FILE}")
     log(f"")
     log(f"  Behavior summary:")
-    log(f"    Click then fast re-press (hold < {args.hold_threshold}ms):  ALLOWED through")
-    log(f"    Drag then fast re-press  (hold >= {args.hold_threshold}ms): SUPPRESSED if gap < {args.threshold}ms")
-    log(f"    All releases:            delayed {args.threshold}ms before forwarding")
+    log(f"    Click releases (hold < {args.hold_threshold}ms):   forwarded immediately")
+    log(f"    Drag releases  (hold >= {args.hold_threshold}ms):  delayed {args.threshold}ms, bounce suppressed")
     log(f"    Buttons filtered:        LEFT, RIGHT, MIDDLE, SIDE, EXTRA")
     if button_remap:
         def _ecode_name(code):
@@ -804,6 +828,8 @@ def main():
             log(f"    Remap:                   {_ecode_name(src)} ({src}) -> {_ecode_name(dst)} ({dst})")
     if args.diagnose_move:
         log(f"  Move diagnostics:  ENABLED (reports at each stats interval)")
+    if args.diagnose_clicks:
+        log(f"  Click diagnostics: ENABLED (logging to {LOG_FILE})")
 
     running = True
 
@@ -899,7 +925,8 @@ def main():
                         quiet=args.quiet,
                         lag_threshold_ms=args.lag_threshold,
                         button_remap=button_remap,
-                        diagnose_move=args.diagnose_move)
+                        diagnose_move=args.diagnose_move,
+                        diagnose_clicks=args.diagnose_clicks)
                     mice.append(dm)
                     fd_map[dm.device.fd] = dm
                     active_paths.add(dev.path)

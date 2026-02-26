@@ -88,39 +88,60 @@ class TestDelayedDebouncedMouse:
         assert result is True
         uinput.write_event.assert_called_once_with(ev)
 
-    def test_release_held_not_forwarded_immediately(self, debounce_module):
-        """A button release should be queued, not forwarded immediately."""
+    def test_click_release_forwarded_immediately(self, debounce_module):
+        """A click release (short hold) should be forwarded immediately."""
         from evdev import ecodes
 
         mouse, uinput = self._make_mouse(debounce_module)
 
-        # Press first
+        # Press first (short hold = click)
         press = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
         mouse.process_event(press)
+        uinput.write_event.reset_mock()
+
+        # Release after short hold
+        release = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
+        mouse.process_event(release)
+
+        # Click release should be forwarded immediately, not pending
+        uinput.write_event.assert_called_once_with(release)
+        assert ecodes.BTN_LEFT not in mouse.pending_release
+
+    def test_drag_release_held_not_forwarded_immediately(self, debounce_module):
+        """A drag release (long hold) should be queued, not forwarded immediately."""
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module)
+
+        # Press and hold long enough to be a drag
+        press = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
+        mouse.process_event(press)
+        time.sleep(0.2)  # 200ms hold = drag
         uinput.write_event.reset_mock()
 
         # Release
         release = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
         mouse.process_event(release)
 
-        # Release should NOT have been forwarded yet
+        # Drag release should NOT have been forwarded yet
         uinput.write_event.assert_not_called()
         assert ecodes.BTN_LEFT in mouse.pending_release
 
-    def test_release_forwarded_after_threshold(self, debounce_module):
-        """A held release should be forwarded once the threshold expires."""
+    def test_drag_release_forwarded_after_threshold(self, debounce_module):
+        """A held drag release should be forwarded once the threshold expires."""
         from evdev import ecodes
 
         mouse, uinput = self._make_mouse(debounce_module, threshold_ms=50)
 
-        # Press then release
+        # Press and hold long enough to be a drag
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)  # 200ms hold = drag
         uinput.write_event.reset_mock()
 
         release = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
         mouse.process_event(release)
 
-        # Not forwarded yet
+        # Not forwarded yet (drag release is pending)
         uinput.write_event.assert_not_called()
 
         # Wait past threshold
@@ -190,9 +211,9 @@ class TestDelayedDebouncedMouse:
 
         mouse, uinput = self._make_mouse(debounce_module, threshold_ms=60)
 
-        # Press left
+        # Press left, hold as drag, release (pending)
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
-        # Release left (pending)
+        time.sleep(0.2)  # 200ms hold = drag
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
         uinput.write_event.reset_mock()
 
@@ -202,7 +223,7 @@ class TestDelayedDebouncedMouse:
 
         assert result is True
         uinput.write_event.assert_called_once_with(right_press)
-        # Left release should still be pending
+        # Left drag release should still be pending
         assert ecodes.BTN_LEFT in mouse.pending_release
 
     def test_click_counter_increments(self, debounce_module):
@@ -231,7 +252,9 @@ class TestDelayedDebouncedMouse:
 
         mouse, _ = self._make_mouse(debounce_module, threshold_ms=60)
 
+        # Must be a drag hold to get a pending release
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)  # 200ms hold = drag
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
 
         deadline = mouse.next_deadline()
@@ -354,10 +377,9 @@ class TestHoldAwareDebounce:
         assert result is False
         assert mouse.suppressed == 1
 
-    def test_short_hold_release_still_delayed(self, debounce_module):
-        """Even for short holds, the release should still be held briefly
-        then flushed (so uinput gets a clean event). The key difference
-        is that a re-press during the hold window is NOT suppressed."""
+    def test_short_hold_release_forwarded_immediately(self, debounce_module):
+        """Short holds (clicks) should have their release forwarded immediately,
+        not delayed. This ensures fast double-clicks are never disrupted."""
         from evdev import ecodes
 
         mouse, uinput = self._make_mouse(debounce_module,
@@ -366,16 +388,13 @@ class TestHoldAwareDebounce:
         # Short click
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
         time.sleep(0.050)
-        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        uinput.write_event.reset_mock()
 
-        # Release should be pending (not forwarded immediately)
-        assert ecodes.BTN_LEFT in mouse.pending_release
+        release = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
+        mouse.process_event(release)
 
-        # Wait for flush
-        time.sleep(0.07)
-        mouse.flush_pending()
-
-        # Release should now be forwarded
+        # Release should be forwarded immediately, not pending
+        uinput.write_event.assert_called_once_with(release)
         assert ecodes.BTN_LEFT not in mouse.pending_release
 
 
@@ -411,18 +430,19 @@ class TestFlushSynReport:
         return mouse, mock_uinput
 
     def test_flushed_release_followed_by_syn(self, debounce_module):
-        """A flushed pending release must be followed by SYN_REPORT.
+        """A flushed pending drag release must be followed by SYN_REPORT.
 
-        Simulates: user clicks a button, doesn't move the mouse, waits
-        for threshold to expire. The flush must emit both the release
+        Simulates: user drags a button, releases, doesn't move the mouse,
+        waits for threshold to expire. The flush must emit both the release
         event AND a SYN_REPORT so uinput delivers it immediately.
         """
         from evdev import ecodes
 
         mouse, uinput = self._make_mouse(debounce_module, threshold_ms=50)
 
-        # Click: press then release (no movement)
+        # Drag: press, hold, then release (no movement after release)
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)  # 200ms hold = drag
         uinput.write_event.reset_mock()
 
         release = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
@@ -472,16 +492,17 @@ class TestFlushSynReport:
         uinput.write_event.assert_not_called()
 
     def test_multiple_buttons_flushed_get_single_syn(self, debounce_module):
-        """If multiple button releases flush at the same time, one SYN_REPORT
+        """If multiple drag releases flush at the same time, one SYN_REPORT
         after all of them is sufficient (but one per release is also acceptable)."""
         from evdev import ecodes
 
         mouse, uinput = self._make_mouse(debounce_module, threshold_ms=50)
 
-        # Press and release two buttons
+        # Press and hold two buttons as drags, then release
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
-        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1))
+        time.sleep(0.2)  # 200ms hold = drag for both
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_RIGHT, 0))
         uinput.write_event.reset_mock()
 
@@ -572,19 +593,20 @@ class TestButtonRemapping:
         assert ecodes.BTN_EXTRA not in mouse.pending_release
 
     def test_non_remapped_buttons_still_debounced(self, debounce_module):
-        """Buttons not in the remap dict should still go through debounce."""
+        """Buttons not in the remap dict should still go through debounce for drags."""
         from evdev import ecodes
 
         remap = {ecodes.BTN_EXTRA: ecodes.KEY_VOLUMEUP}
         mouse, uinput = self._make_mouse(debounce_module, remap=remap)
 
-        # BTN_LEFT is not remapped — should be debounced as normal
+        # BTN_LEFT is not remapped — drag release should be debounced
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)  # 200ms hold = drag
         uinput.write_event.reset_mock()
 
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
 
-        # Release should be pending (debounced), not forwarded
+        # Drag release should be pending (debounced), not forwarded
         uinput.write_event.assert_not_called()
         assert ecodes.BTN_LEFT in mouse.pending_release
 
@@ -608,18 +630,19 @@ class TestButtonRemapping:
             assert written.code == dst, f"Expected {dst} for {src}, got {written.code}"
 
     def test_no_remap_default(self, debounce_module):
-        """With no remap configured, all buttons go through normal debounce."""
+        """With no remap configured, drag releases go through normal debounce."""
         from evdev import ecodes
 
         mouse, uinput = self._make_mouse(debounce_module, remap=None)
 
-        # BTN_EXTRA should be debounced normally (no remap)
+        # BTN_EXTRA drag should be debounced normally (no remap)
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_EXTRA, 1))
+        time.sleep(0.2)  # 200ms hold = drag
         uinput.write_event.reset_mock()
 
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_EXTRA, 0))
 
-        # Should be pending (debounced)
+        # Drag release should be pending (debounced)
         assert ecodes.BTN_EXTRA in mouse.pending_release
 
 
@@ -1254,3 +1277,220 @@ class TestDeviceMonitor:
         assert 'drain_inotify' in source, (
             "main() should drain inotify events when the monitor FD is readable"
         )
+
+
+class TestClickDiagnostics:
+    """Tests for --diagnose-clicks click-level telemetry.
+
+    When diagnose_clicks=True, the filter logs every press/release/flush
+    with full timing details to the log file (not stdout). This helps
+    diagnose double-click issues by making all click decision paths visible.
+    """
+
+    def _make_mouse(self, debounce_module, threshold_ms=60, hold_threshold_ms=150,
+                    diagnose_clicks=True):
+        from evdev import ecodes
+
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, threshold_ms,
+                hold_threshold_ms=hold_threshold_ms, quiet=True,
+                diagnose_clicks=diagnose_clicks,
+            )
+        return mouse, mock_uinput
+
+    def test_diagnose_clicks_state_initialized(self, debounce_module):
+        """diagnose_clicks=True should initialize tracking state."""
+        mouse, _ = self._make_mouse(debounce_module)
+        assert mouse.diagnose_clicks is True
+        assert mouse.last_press_forwarded == {}
+
+    def test_diagnose_clicks_disabled_by_default(self, debounce_module):
+        """Default construction should have diagnose_clicks=False."""
+        mouse, _ = self._make_mouse(debounce_module, diagnose_clicks=False)
+        assert mouse.diagnose_clicks is False
+
+    def test_normal_press_logs_click_diag(self, debounce_module):
+        """Normal press should log CLICK_DIAG with path=normal."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+
+        diag_calls = [c for c in mock_log.call_args_list
+                      if 'CLICK_DIAG' in str(c) and 'PRESS' in str(c)]
+        assert len(diag_calls) == 1
+        msg = diag_calls[0].args[0]
+        assert 'LEFT PRESS' in msg
+        assert 'path=normal' in msg
+        assert diag_calls[0].kwargs.get('also_print') is False
+
+    def test_normal_press_logs_pp_gap(self, debounce_module):
+        """Second press should show press-to-press gap."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module)
+
+        # First press
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        # Release + flush
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        time.sleep(0.07)
+        mouse.flush_pending()
+
+        time.sleep(0.05)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+
+        diag_calls = [c for c in mock_log.call_args_list
+                      if 'CLICK_DIAG' in str(c) and 'PRESS' in str(c)]
+        assert len(diag_calls) == 1
+        msg = diag_calls[0].args[0]
+        assert 'pp_gap=' in msg
+        assert 'pp_gap=--' not in msg  # Should have a real value
+
+    def test_release_logs_click_diag(self, debounce_module):
+        """Click release should log CLICK_DIAG with hold duration and forwarded."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.050)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+
+        diag_calls = [c for c in mock_log.call_args_list
+                      if 'CLICK_DIAG' in str(c) and 'RELEASE' in str(c)]
+        assert len(diag_calls) == 1
+        msg = diag_calls[0].args[0]
+        assert 'LEFT RELEASE' in msg
+        assert 'hold=' in msg
+        assert 'type=click -> forwarded' in msg
+        assert diag_calls[0].kwargs.get('also_print') is False
+
+    def test_release_drag_type_logged(self, debounce_module):
+        """Long hold release should be logged as type=drag."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.200)  # 200ms > 150ms hold threshold
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+
+        diag_calls = [c for c in mock_log.call_args_list
+                      if 'CLICK_DIAG' in str(c) and 'RELEASE' in str(c)]
+        assert len(diag_calls) == 1
+        assert 'type=drag' in diag_calls[0].args[0]
+
+    def test_flush_logs_click_diag(self, debounce_module):
+        """Flushed pending drag release should log CLICK_DIAG FLUSH."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module, threshold_ms=50)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)  # 200ms hold = drag
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        time.sleep(0.06)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            mouse.flush_pending()
+
+        diag_calls = [c for c in mock_log.call_args_list
+                      if 'CLICK_DIAG' in str(c) and 'FLUSH' in str(c)]
+        assert len(diag_calls) == 1
+        msg = diag_calls[0].args[0]
+        assert 'LEFT FLUSH' in msg
+        assert 'waited=' in msg
+        assert 'type=drag' in msg
+        assert diag_calls[0].kwargs.get('also_print') is False
+
+    def test_suppressed_logs_click_diag(self, debounce_module):
+        """Suppressed drag bounce should log CLICK_DIAG SUPPRESSED."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module, threshold_ms=60)
+
+        # Long hold (drag)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.200)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+
+        # Bounce re-press
+        time.sleep(0.030)
+        with patch.object(debounce_module, 'log') as mock_log:
+            mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+
+        diag_calls = [c for c in mock_log.call_args_list
+                      if 'CLICK_DIAG' in str(c) and 'SUPPRESSED' in str(c)]
+        assert len(diag_calls) == 1
+        msg = diag_calls[0].args[0]
+        assert 'LEFT PRESS SUPPRESSED' in msg
+        assert 'pp_gap=' in msg
+        assert diag_calls[0].kwargs.get('also_print') is False
+
+    def test_no_click_diag_when_disabled(self, debounce_module):
+        """With diagnose_clicks=False, no CLICK_DIAG should be logged."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module, diagnose_clicks=False)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            # Full click cycle: press, release, flush
+            mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+            time.sleep(0.050)
+            mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+            time.sleep(0.07)
+            mouse.flush_pending()
+
+        diag_calls = [c for c in mock_log.call_args_list
+                      if 'CLICK_DIAG' in str(c)]
+        assert len(diag_calls) == 0
+
+    def test_last_press_forwarded_tracked(self, debounce_module):
+        """last_press_forwarded should be updated on forwarded presses."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module)
+
+        before = time.monotonic()
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        after = time.monotonic()
+
+        assert ecodes.BTN_LEFT in mouse.last_press_forwarded
+        assert before <= mouse.last_press_forwarded[ecodes.BTN_LEFT] <= after
+
+    def test_rp_gap_shown_after_flush(self, debounce_module):
+        """After a release is flushed, next press should show rp_gap."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module, threshold_ms=50)
+
+        # Click + flush
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        time.sleep(0.06)
+        mouse.flush_pending()
+
+        time.sleep(0.050)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+
+        diag_calls = [c for c in mock_log.call_args_list
+                      if 'CLICK_DIAG' in str(c) and 'PRESS' in str(c)]
+        assert len(diag_calls) == 1
+        msg = diag_calls[0].args[0]
+        assert 'rp_gap=' in msg
+        assert 'rp_gap=--' not in msg  # Should have a real value
